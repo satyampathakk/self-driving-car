@@ -55,7 +55,7 @@ STREAM_URL  = f"http://{SERVER_IP}:{SERVER_PORT}/upload_frame"
 USE_IP_CAMERA = False  # Start with laptop cam by default
 
 # IP Camera (Android IP Webcam app)
-IP_CAMERA_URL = "http://192.168.29.174:8080/video"
+IP_CAMERA_URL = "http://192.168.1.5:8080/video"
 USE_SNAPSHOT_MODE = True  # Set True if video stream has MJPEG issues
 
 # USB Webcam

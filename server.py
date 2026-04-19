@@ -1,13 +1,13 @@
 """
 ============================================================
-Self-Driving Car — Python Server  (v2 — with steering timeout & run timer)
+Self-Driving Car — Python Server (v3 — with backup logic)
 ============================================================
 New features:
-  - Steering correction timeout: if car steers left/right for longer
-    than `steer_timeout` seconds it forces a correction back to centre
-  - Run timer: car runs for `run_duration` seconds then auto-stops
-  - Dashboard controls: start/stop button, adjust all timers live
-  - All tunable params exposed via /config  (GET + POST JSON)
+  - Back sensor support (4 sensors total: F/B/L/R)
+  - Smart backup when boxed in (both sides < 15cm)
+  - Backs up until clearance is found, then turns
+  - State machine: NORMAL, BACKING_UP, STOPPED
+  - All original features (steering timeout, run timer, dashboard)
 ============================================================
 """
 
@@ -26,42 +26,50 @@ logging.basicConfig(level=logging.INFO,
 log = logging.getLogger(__name__)
 
 # ============================================================
-# VISION OBSTACLE DETECTOR (RED OBJECTS)
+# VISION OBSTACLE DETECTOR (RED OBJECTS) - MINIMAL INTERFERENCE
 # ============================================================
-vision_detector = VisionObstacleDetector(min_area=500, history_size=5)
-log.info("Vision obstacle detector initialized (detects RED objects)")
+vision_detector = VisionObstacleDetector(min_area=2000, history_size=10)
+log.info("Vision obstacle detector initialized (MINIMAL mode)")
 
 # ============================================================
 # CONFIG  (all tunable at runtime via /config POST or dashboard)
 # ============================================================
 cfg_lock = threading.Lock()
 cfg = {
-    # Safety thresholds (cm)
-    "stop_distance":    15,
-    "slow_distance":    30,
-    "side_distance":    12,
+    # Sensor decision thresholds (cm) - MATCHES ESP32
+    "front_stop_distance": 20,   # Front < 20cm triggers decision
+    "side_avoid_distance": 20,   # Side < 20cm used when front blocked
+    "backup_threshold":    15,   # Both sides < 15cm → backup
+    "backup_clearance":    25,   # Need 25cm clearance to stop backing up
+    "back_safety_distance": 10,  # Don't backup if back < 10cm
 
     # Speeds  (0-255)
     "base_speed":       200,
     "slow_speed":       130,
     "turn_speed":       160,
+    "backup_speed":     160,
+
+    # ESP32 Motor Speeds (sent in commands)
+    "motor_speed_normal": 200,  # F:200
+    "motor_speed_turn":   180,  # L:180, R:180
+    "motor_speed_hard":   220,  # HL:220, HR:220
+    "motor_speed_backup": 160,  # B:160
 
     # Steering correction
-    # If the car steers in one direction for longer than this (seconds),
-    # it issues a correction pulse in the opposite direction for
-    # `correction_duration` seconds to bring it back to the original line.
     "steer_timeout":        2.0,   # seconds before correction kicks in
     "correction_duration":  0.8,   # seconds to hold correction pulse
 
-    # Lane dead-zone (pixels) — below this offset we consider car centred
-    "steer_threshold":  30,
+    # Lane dead-zone (pixels) — WIDENED for minimal vision interference
+    "steer_threshold":  80,
+
+    # Vision interference settings - MINIMAL
+    "vision_min_area":      2000,
+    "vision_center_width":  0.5,
+    "vision_confidence":    8,
 
     # Run timer
-    # car_running = True → car is allowed to move
-    # run_duration > 0   → auto-stop after this many seconds
-    # run_duration = 0   → run indefinitely (until manual stop)
     "run_duration":     0,         # seconds, 0 = unlimited
-    "car_running":      False,     # start stopped; use dashboard Start button
+    "car_running":      False,
 }
 
 # ============================================================
@@ -73,14 +81,19 @@ state = {
     "command":          "S:0",
     "reason":           "Stopped — press Start",
     "frame":            None,
-    "steer_direction":  None,      # "L" | "R" | None
-    "steer_since":      None,      # time.time() when current steer started
-    "correcting":       False,     # True while correction pulse is active
-    "correction_until": 0,         # time.time() when correction ends
-    "run_started_at":   None,      # time.time() when car was started
-    "time_remaining":   None,      # seconds left on run timer (None = unlimited)
-    "vision_obstacle":  False,     # Red obstacle detected
-    "vision_position":  "none",    # Position: left/right/center/none
+    "steer_direction":  None,
+    "steer_since":      None,
+    "correcting":       False,
+    "correction_until": 0,
+    "run_started_at":   None,
+    "time_remaining":   None,
+    "vision_obstacle":  False,
+    "vision_position":  "none",
+    
+    # Backup state machine
+    "car_state":        "NORMAL",     # NORMAL, BACKING_UP, STOPPED
+    "backup_started_at": None,
+    "preferred_turn_direction": 0,    # 1 = left, -1 = right, 0 = not set
 }
 
 ws_clients = set()
@@ -134,7 +147,6 @@ def config_endpoint():
     with cfg_lock:
         for key, val in data.items():
             if key in cfg:
-                # cast to same type as existing value
                 try:
                     cfg[key] = type(cfg[key])(val)
                 except (ValueError, TypeError):
@@ -150,11 +162,15 @@ def config_endpoint():
                     state["steer_direction"] = None
                     state["steer_since"]     = None
                     state["correcting"]      = False
-                    state["reason"]          = "Starting..."  # Clear old reason
+                    state["car_state"]       = "NORMAL"
+                    state["backup_started_at"] = None
+                    state["preferred_turn_direction"] = 0
+                    state["reason"]          = "Starting..."
                 log.info("Car STARTED")
             else:
                 with state_lock:
                     state["reason"] = "Stopped — press Start"
+                    state["car_state"] = "NORMAL"
                 log.info("Car STOPPED")
                 send_command("S:0")
 
@@ -235,81 +251,11 @@ def detect_lanes(frame):
     cv2.line(annotated, (mid_x, roi_top),       (mid_x, h),       (255, 255, 0), 1)
     return steer_offset, annotated
 
-def detect_red_objects(frame):
-    """
-    Detect red objects using HSV color detection
-    Returns: (obstacle_detected, position, mask)
-    """
-    h, w = frame.shape[:2]
-    
-    # Convert to HSV
-    hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
-    
-    # Red color ranges (two ranges because red wraps around in HSV)
-    lower1 = np.array([0, 120, 70])
-    upper1 = np.array([10, 255, 255])
-    lower2 = np.array([160, 120, 70])
-    upper2 = np.array([180, 255, 255])
-    
-    mask1 = cv2.inRange(hsv, lower1, upper1)
-    mask2 = cv2.inRange(hsv, lower2, upper2)
-    mask = mask1 + mask2
-    
-    # Find contours
-    contours, _ = cv2.findContours(mask, cv2.RETR_TREE, cv2.CHAIN_APPROX_SIMPLE)
-    
-    obstacle = False
-    position = "none"
-    
-    for cnt in contours:
-        area = cv2.contourArea(cnt)
-        if area > 500:
-            x, y, w_box, h_box = cv2.boundingRect(cnt)
-            cx = x + w_box // 2
-            obstacle = True
-            
-            # Determine position
-            if cx < w // 3:
-                position = "left"
-            elif cx > 2 * w // 3:
-                position = "right"
-            else:
-                position = "center"
-            
-            # Draw red bounding box
-            cv2.rectangle(frame, (x, y), (x + w_box, y + h_box), (0, 0, 255), 2)
-            cv2.putText(frame, "RED", (x, y - 5),
-                       cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 0, 255), 1)
-    
-    return obstacle, position, frame
-
-
-def detect_obstacle(frame):
-    """Legacy contour-based obstacle detection"""
-    h, w = frame.shape[:2]
-    roi  = frame[int(h * 0.5):h, int(w * 0.25):int(w * 0.75)]
-    gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
-    _, thresh = cv2.threshold(gray, 60, 255, cv2.THRESH_BINARY_INV)
-    contours, _ = cv2.findContours(thresh, cv2.RETR_EXTERNAL,
-                                    cv2.CHAIN_APPROX_SIMPLE)
-    return any(cv2.contourArea(c) > 4000 for c in contours)
-
 # ============================================================
-# STEERING TRACKER — prevents infinite steer in one direction
+# STEERING TRACKER
 # ============================================================
 def track_and_correct_steer(raw_cmd: str) -> tuple[str, str, bool]:
-    """
-    Given the raw command from decide(), applies steering timeout logic.
-
-    Returns (final_cmd, extra_reason, is_correcting)
-
-    Logic:
-      - If car is steering L or R, track how long it has been doing so.
-      - If it exceeds steer_timeout seconds → start a correction pulse in
-        the opposite direction for correction_duration seconds.
-      - During correction the command is overridden to the opposite direction.
-      - After correction finishes, steering state resets and normal logic resumes.
-    """
+    """Apply steering timeout logic"""
     now = time.time()
     with cfg_lock:
         steer_timeout       = cfg["steer_timeout"]
@@ -322,38 +268,33 @@ def track_and_correct_steer(raw_cmd: str) -> tuple[str, str, bool]:
         steer_direction  = state["steer_direction"]
         steer_since      = state["steer_since"]
 
-    cmd_dir = raw_cmd.split(":")[0]   # e.g. "F", "L", "R", "S", "HL", "HR"
+    cmd_dir = raw_cmd.split(":")[0]
 
-    # --- Active correction pulse ---
+    # Active correction pulse
     if correcting:
         if now < correction_until:
-            # Still in correction window — hold opposite direction
             opp = "R" if steer_direction == "L" else "L"
             corr_cmd = f"{opp}:{turn_speed}"
             return corr_cmd, f"Correction pulse ({opp}) → recentring", True
         else:
-            # Correction finished — reset state
             with state_lock:
                 state["correcting"]      = False
                 state["steer_direction"] = None
                 state["steer_since"]     = None
             return raw_cmd, "", False
 
-    # --- Track steering direction ---
+    # Track steering direction
     is_steer = cmd_dir in ("L", "R", "HL", "HR")
     canonical = "L" if cmd_dir in ("L", "HL") else ("R" if cmd_dir in ("R", "HR") else None)
 
     if is_steer and canonical:
         if steer_direction != canonical:
-            # New steer direction — reset timer
             with state_lock:
                 state["steer_direction"] = canonical
                 state["steer_since"]     = now
         else:
-            # Same direction — check elapsed
             elapsed = now - (steer_since or now)
             if elapsed >= steer_timeout:
-                # Timeout! Start correction
                 with state_lock:
                     state["correcting"]      = True
                     state["correction_until"] = now + correction_duration
@@ -362,7 +303,6 @@ def track_and_correct_steer(raw_cmd: str) -> tuple[str, str, bool]:
                 log.info(f"[STEER] Timeout after {elapsed:.1f}s → correction {opp}")
                 return corr_cmd, f"Steer timeout ({elapsed:.1f}s) → correction {opp}", True
     else:
-        # Not steering — reset tracker
         if steer_direction is not None:
             with state_lock:
                 state["steer_direction"] = None
@@ -374,10 +314,6 @@ def track_and_correct_steer(raw_cmd: str) -> tuple[str, str, bool]:
 # RUN TIMER
 # ============================================================
 def check_run_timer() -> tuple[bool, float | None]:
-    """
-    Returns (should_run, seconds_remaining)
-    should_run = False → override everything with STOP
-    """
     with cfg_lock:
         car_running  = cfg["car_running"]
         run_duration = cfg["run_duration"]
@@ -386,7 +322,7 @@ def check_run_timer() -> tuple[bool, float | None]:
         return False, None
 
     if run_duration <= 0:
-        return True, None   # unlimited
+        return True, None
 
     with state_lock:
         started_at = state["run_started_at"]
@@ -398,7 +334,6 @@ def check_run_timer() -> tuple[bool, float | None]:
     remaining = run_duration - elapsed
 
     if remaining <= 0:
-        # Auto-stop
         with cfg_lock:
             cfg["car_running"] = False
         send_command("S:0")
@@ -411,48 +346,154 @@ def check_run_timer() -> tuple[bool, float | None]:
     return True, round(remaining, 1)
 
 # ============================================================
-# DECISION ENGINE
+# DECISION ENGINE - WITH BACKUP LOGIC
 # ============================================================
-def decide(steer_offset: int, visual_obstacle: bool) -> tuple[str, str]:
+def decide(steer_offset: int, visual_obstacle: bool, vision_position: str) -> tuple[str, str]:
+    """
+    STATE MACHINE DECISION LOGIC - MATCHES ESP32 CODE
+    
+    States:
+      NORMAL      - Normal driving with obstacle avoidance
+      BACKING_UP  - Backing up to create space when boxed in
+      STOPPED     - Safety stop (can't move)
+    """
     with state_lock:
         sensors = dict(state["sensors"])
+        car_state = state["car_state"]
+        backup_started_at = state["backup_started_at"]
+        preferred_turn = state["preferred_turn_direction"]
+    
     with cfg_lock:
-        stop_d   = cfg["stop_distance"]
-        slow_d   = cfg["slow_distance"]
-        side_d   = cfg["side_distance"]
-        base_spd = cfg["base_speed"]
-        slow_spd = cfg["slow_speed"]
-        turn_spd = cfg["turn_speed"]
-        steer_th = cfg["steer_threshold"]
+        motor_normal = cfg["motor_speed_normal"]
+        motor_hard = cfg["motor_speed_hard"]
+        motor_backup = cfg["motor_speed_backup"]
+        front_threshold = cfg["front_stop_distance"]
+        side_threshold = cfg["side_avoid_distance"]
+        backup_thresh = cfg["backup_threshold"]
+        backup_clear = cfg["backup_clearance"]
+        back_safety = cfg["back_safety_distance"]
 
     front = sensors.get("f", 999)
     back  = sensors.get("b", 999)
     left  = sensors.get("l", 999)
     right = sensors.get("r", 999)
 
-    if front < stop_d or visual_obstacle:
-        reason = f"OBSTACLE front={front}cm visual={visual_obstacle}"
-        if back > 30:
-            return f"B:{slow_spd}", reason + " → reversing"
-        return "S:0", reason + " → stopping"
-
-    if left < side_d and right >= side_d:
-        return f"HR:{turn_spd}", f"Too close left ({left}cm) → hard right"
-    if right < side_d and left >= side_d:
-        return f"HL:{turn_spd}", f"Too close right ({right}cm) → hard left"
-    if left < side_d and right < side_d:
-        return "S:0", f"Boxed in L={left} R={right} → stop"
-
-    speed = slow_spd if front < slow_d else base_spd
-
-    if steer_offset > steer_th:
-        intensity = min(int(abs(steer_offset) / 3), 60)
-        return f"L:{turn_spd - intensity}", f"Lane offset +{steer_offset}px → left"
-    elif steer_offset < -steer_th:
-        intensity = min(int(abs(steer_offset) / 3), 60)
-        return f"R:{turn_spd - intensity}", f"Lane offset {steer_offset}px → right"
-
-    return f"F:{speed}", f"Centred (offset={steer_offset}px, front={front}cm)"
+    # ════════════════════════════════════════════════════════════
+    # STATE: BACKING_UP
+    # ════════════════════════════════════════════════════════════
+    if car_state == "BACKING_UP":
+        # Check if back is safe
+        if back < back_safety:
+            log.warning(f"[DECISION] Back blocked! Emergency stop (back={back})")
+            with state_lock:
+                state["car_state"] = "STOPPED"
+            return "S:0", f"STOPPED: Back blocked at {back}cm"
+        
+        # Check if we now have clearance on at least one side
+        left_clear  = (left >= backup_clear)
+        right_clear = (right >= backup_clear)
+        
+        if left_clear or right_clear:
+            # We have space! Stop backing up and turn
+            log.info(f"[DECISION] Space created! L={left} R={right}")
+            
+            # Decide which way to turn
+            if right_clear and not left_clear:
+                log.info("[DECISION] Right clear - turning RIGHT")
+                with state_lock:
+                    state["car_state"] = "NORMAL"
+                    state["backup_started_at"] = None
+                    state["preferred_turn_direction"] = -1
+                return f"HR:{motor_hard}", f"RIGHT: Space created on right (R={right})"
+            
+            elif left_clear and not right_clear:
+                log.info("[DECISION] Left clear - turning LEFT")
+                with state_lock:
+                    state["car_state"] = "NORMAL"
+                    state["backup_started_at"] = None
+                    state["preferred_turn_direction"] = 1
+                return f"HL:{motor_hard}", f"LEFT: Space created on left (L={left})"
+            
+            else:
+                # Both clear - use preferred or default left
+                if preferred_turn == -1:
+                    log.info("[DECISION] Both clear - using preferred RIGHT")
+                    with state_lock:
+                        state["car_state"] = "NORMAL"
+                        state["backup_started_at"] = None
+                    return f"HR:{motor_hard}", f"RIGHT: Both sides clear (preferred)"
+                else:
+                    log.info("[DECISION] Both clear - using preferred LEFT")
+                    with state_lock:
+                        state["car_state"] = "NORMAL"
+                        state["backup_started_at"] = None
+                        state["preferred_turn_direction"] = 1
+                    return f"HL:{motor_hard}", f"LEFT: Both sides clear (default)"
+        
+        # Still boxed in - keep backing up
+        elapsed = time.time() - (backup_started_at or time.time())
+        return f"B:{motor_backup}", f"BACKING UP: Still boxed in L={left} R={right} ({elapsed:.1f}s)"
+    
+    # ════════════════════════════════════════════════════════════
+    # STATE: STOPPED
+    # ════════════════════════════════════════════════════════════
+    if car_state == "STOPPED":
+        # Check if we can recover
+        if front >= front_threshold and back >= back_safety:
+            log.info("[DECISION] Recovering from stopped state")
+            with state_lock:
+                state["car_state"] = "NORMAL"
+            return f"F:{motor_normal}", f"RECOVERING: Obstacles cleared"
+        
+        return "S:0", f"STOPPED: Waiting for clearance F={front} B={back}"
+    
+    # ════════════════════════════════════════════════════════════
+    # STATE: NORMAL - MAIN DRIVING LOGIC
+    # ════════════════════════════════════════════════════════════
+    
+    # Front < threshold → obstacle avoidance
+    if front < front_threshold:
+        
+        # ─── CASE 1: Both sides blocked (< backup_threshold) ───
+        if right < backup_thresh and left < backup_thresh:
+            # BOXED IN! Need to back up first
+            
+            # Check if we can safely back up
+            if back < back_safety:
+                log.warning(f"[DECISION] Completely stuck! F={front} L={left} R={right} B={back}")
+                with state_lock:
+                    state["car_state"] = "STOPPED"
+                return "S:0", f"STOPPED: Boxed in, can't backup (B={back})"
+            
+            # Start backing up
+            log.info(f"[DECISION] BOXED IN - starting backup (F={front} L={left} R={right})")
+            with state_lock:
+                state["car_state"] = "BACKING_UP"
+                state["backup_started_at"] = time.time()
+            
+            return f"B:{motor_backup}", f"BACKING UP: Boxed in F={front} L={left} R={right}"
+        
+        # ─── CASE 2: Right blocked, left clear ───
+        elif right < side_threshold:
+            with state_lock:
+                state["preferred_turn_direction"] = 1
+            return f"HL:{motor_hard}", f"LEFT: Front + right blocked (F={front} R={right})"
+        
+        # ─── CASE 3: Left blocked, right clear ───
+        elif left < side_threshold:
+            with state_lock:
+                state["preferred_turn_direction"] = -1
+            return f"HR:{motor_hard}", f"RIGHT: Front + left blocked (F={front} L={left})"
+        
+        # ─── CASE 4: Only front blocked, both sides clear ───
+        else:
+            with state_lock:
+                state["preferred_turn_direction"] = 1
+            return f"HL:{motor_hard}", f"LEFT: Only front blocked (F={front})"
+    
+    # ─── CASE 5: Front clear - FORWARD ───
+    else:
+        return f"F:{motor_normal}", f"FORWARD: Front clear F={front} L={left} R={right}"
 
 # ============================================================
 # FRAME PROCESSOR
@@ -476,37 +517,15 @@ def process_frame(img):
             _annotate_and_store(img, final_cmd, reason, False, 0, False, time_remaining)
             return
 
-        # 2. Vision-based red obstacle detection
+        # 2. Vision detection
         vision_obstacle, vision_pos, vision_frame, vision_mask = vision_detector.detect(img)
         vision_pos_smoothed = vision_detector.get_smoothed_position(vision_pos)
         
-        # 3. Lane detection on annotated frame
+        # 3. Lane detection
         steer_offset, annotated = detect_lanes(vision_frame)
         
-        # Legacy obstacle detection (kept for compatibility)
-        legacy_visual_obs = detect_obstacle(vision_frame)
-        
-        # Combine obstacle detections
-        combined_obstacle = legacy_visual_obs or (vision_obstacle and vision_pos_smoothed == "center")
-
-        # 4. Raw decision
-        raw_cmd, raw_reason = decide(steer_offset, combined_obstacle)
-        
-        # Override with vision-based avoidance if red obstacle detected
-        if vision_obstacle:
-            with cfg_lock:
-                turn_spd = cfg["turn_speed"]
-            
-            avoid_dir = vision_detector.get_avoidance_direction(vision_pos_smoothed)
-            if avoid_dir == "RIGHT":
-                raw_cmd = f"HR:{turn_spd}"
-                raw_reason = f"Red obstacle on {vision_pos_smoothed} → hard right"
-            elif avoid_dir == "LEFT":
-                raw_cmd = f"HL:{turn_spd}"
-                raw_reason = f"Red obstacle on {vision_pos_smoothed} → hard left"
-            elif avoid_dir == "STOP":
-                raw_cmd = "S:0"
-                raw_reason = f"Red obstacle in center → stop"
+        # 4. Decision (sensor-first, vision as context)
+        raw_cmd, raw_reason = decide(steer_offset, vision_obstacle, vision_pos_smoothed)
 
         # 5. Steering correction override
         final_cmd, corr_reason, is_correcting = track_and_correct_steer(raw_cmd)
@@ -522,13 +541,12 @@ def process_frame(img):
             state["vision_obstacle"] = vision_obstacle
             state["vision_position"] = vision_pos_smoothed
 
-        _annotate_and_store(annotated, final_cmd, reason, combined_obstacle,
+        _annotate_and_store(annotated, final_cmd, reason, vision_obstacle,
                             steer_offset, is_correcting, time_remaining)
     except Exception as e:
         log.error(f"process_frame error: {e}")
         import traceback
         traceback.print_exc()
-        # Set error state
         with state_lock:
             state["command"] = "S:0"
             state["reason"] = f"Error: {str(e)}"
@@ -539,16 +557,23 @@ def _annotate_and_store(frame, cmd, reason, visual_obs=False,
         sensors = dict(state["sensors"])
         vision_obs = state.get("vision_obstacle", False)
         vision_pos = state.get("vision_position", "none")
+        car_state = state.get("car_state", "NORMAL")
 
     hud = frame.copy() if hasattr(frame, 'copy') else frame
     color = (0, 80, 220) if cmd.startswith("S") else \
             (0, 220, 80) if cmd.startswith("F") else \
+            (180, 0, 255) if cmd.startswith("B") else \
             (220, 200, 0) if cmd[0] in "LR" else \
             (0, 200, 220)
 
     cv2.putText(hud, f"CMD: {cmd}", (5, 20),
                 cv2.FONT_HERSHEY_SIMPLEX, 0.55, color, 2)
-    if correcting:
+    
+    # State indicator
+    if car_state == "BACKING_UP":
+        cv2.putText(hud, "BACKING UP", (5, 40),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.45, (180, 0, 255), 2)
+    elif correcting:
         cv2.putText(hud, "CORRECTING", (5, 40),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 100, 255), 2)
     else:
@@ -561,15 +586,11 @@ def _annotate_and_store(frame, cmd, reason, visual_obs=False,
                 f"L:{sensors['l']}  R:{sensors['r']} cm",
                 (5, 228), cv2.FONT_HERSHEY_SIMPLEX, 0.37, (0, 255, 255), 1)
 
-    # Vision detection display
+    # Vision detection
     if vision_obs:
         vision_color = (0, 0, 255) if vision_pos == "center" else (0, 200, 255)
         cv2.putText(hud, f"RED OBSTACLE: {vision_pos.upper()}", (5, 60),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.35, vision_color, 1)
-
-    if visual_obs:
-        cv2.putText(hud, "VISUAL OBSTACLE", (55, 120),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.65, (0, 0, 255), 2)
 
     if time_remaining is not None:
         cv2.putText(hud, f"TIME: {time_remaining}s", (230, 20),
@@ -578,32 +599,6 @@ def _annotate_and_store(frame, cmd, reason, visual_obs=False,
     _, jpg = cv2.imencode(".jpg", hud, [cv2.IMWRITE_JPEG_QUALITY, 80])
     with state_lock:
         state["frame"] = jpg.tobytes()
-
-# ============================================================
-# ESP32-CAM stream mode
-# ============================================================
-def esp32_stream_loop():
-    log.info(f"Pulling ESP32 stream: {urllib.request.urlopen}")
-    while True:
-        try:
-            stream   = urllib.request.urlopen(
-                f"http://{urllib.request.urlopen}:81/stream", timeout=5)
-            byte_buf = b""
-            while True:
-                byte_buf += stream.read(4096)
-                a = byte_buf.find(b'\xff\xd8')
-                b_idx = byte_buf.find(b'\xff\xd9')
-                if a != -1 and b_idx != -1 and b_idx > a:
-                    jpg      = byte_buf[a:b_idx+2]
-                    byte_buf = byte_buf[b_idx+2:]
-                    img = cv2.imdecode(np.frombuffer(jpg, dtype=np.uint8),
-                                       cv2.IMREAD_COLOR)
-                    if img is not None:
-                        process_frame(cv2.resize(img, (320, 240)))
-        except Exception as e:
-            log.warning(f"ESP32 stream error: {e} — retry in 2s")
-            send_command("S:0")
-            time.sleep(2)
 
 # ============================================================
 # MJPEG FEED
@@ -632,7 +627,7 @@ def status_endpoint():
     return jsonify({**s, **c})
 
 # ============================================================
-# DASHBOARD HTML
+# DASHBOARD HTML (same as before, works with new state)
 # ============================================================
 DASHBOARD = r"""
 <!DOCTYPE html>
@@ -683,6 +678,7 @@ DASHBOARD = r"""
   }
   .badge.running  { color: var(--green);  border-color: var(--green);  background: #00ff8820; }
   .badge.stopped  { color: var(--danger); border-color: var(--danger); background: #ff444420; }
+  .badge.backing  { color: var(--purple); border-color: var(--purple); background: #bb88ff20; }
   .badge.correct  { color: var(--purple); border-color: var(--purple); background: #bb88ff20; }
 
   /* Main layout */
@@ -826,12 +822,13 @@ DASHBOARD = r"""
   #log .entry { color: var(--accent); }
   #log .entry.warn { color: var(--warn); }
   #log .entry.corr { color: var(--purple); }
+  #log .entry.backup { color: #b488ff; }
 </style>
 </head>
 <body>
 
 <header>
-  <h1>&#9632; SELF-DRIVING CAR</h1>
+  <h1>&#9632; SELF-DRIVING CAR v3</h1>
   <span class="badge stopped" id="status-badge">STOPPED</span>
 </header>
 
@@ -871,7 +868,7 @@ DASHBOARD = r"""
       </div>
     </div>
 
-    <!-- Vision Obstacle Detection -->
+    <!-- Vision Detection -->
     <div class="card">
       <h3>Vision Detection (Red Objects)</h3>
       <div id="vision-status" style="font-size:13px;padding:8px;background:var(--bg3);border-radius:6px;margin-bottom:4px;min-height:24px;color:var(--green)">
@@ -879,20 +876,6 @@ DASHBOARD = r"""
       </div>
       <div id="vision-position" style="font-size:11px;color:var(--muted);">
         Position: none
-      </div>
-    </div>
-
-    <!-- Steering tracker -->
-    <div class="card">
-      <h3>Steering Tracker</h3>
-      <div id="steer-track">
-        <span id="steer-dir-lbl" style="width:40px;color:var(--warn)">—</span>
-        <div id="steer-bar-wrap"><div id="steer-bar"></div></div>
-        <span id="steer-time-lbl" style="width:48px;text-align:right;font-size:11px">0.0s</span>
-        <span id="corr-lbl" style="width:60px;font-size:10px;color:var(--purple)"></span>
-      </div>
-      <div style="font-size:10px;color:var(--muted);margin-top:6px">
-        Bar fills to steer timeout → correction pulse fires
       </div>
     </div>
 
@@ -922,78 +905,68 @@ DASHBOARD = r"""
                oninput="updateSlider('sl-run','lbl-run',v=>v==0?'∞':v+'s'); sendCfg('run_duration',+this.value)">
         <span class="val-lbl" id="lbl-run">∞</span>
       </div>
-      <div style="font-size:11px;color:var(--muted)">
-        Car auto-stops after this duration.<br>
-        Resets every time you press Start.
-      </div>
     </div>
 
-    <!-- Steering correction -->
+    <!-- Backup thresholds -->
     <div class="card">
-      <h3>Steering Correction</h3>
+      <h3>Backup Logic (cm)</h3>
       <div class="slider-row">
-        <label>Steer timeout (s)</label>
-        <input type="range" id="sl-stto" min="0.5" max="10" step="0.5" value="2"
-               oninput="updateSlider('sl-stto','lbl-stto',v=>v+'s'); sendCfg('steer_timeout',+this.value)">
-        <span class="val-lbl" id="lbl-stto">2s</span>
+        <label>Backup threshold</label>
+        <input type="range" id="sl-backup-thresh" min="10" max="30" value="15"
+               oninput="updateSlider('sl-backup-thresh','lbl-backup-thresh',v=>v+'cm'); sendCfg('backup_threshold',+this.value)">
+        <span class="val-lbl" id="lbl-backup-thresh">15cm</span>
       </div>
       <div class="slider-row">
-        <label>Correction pulse (s)</label>
-        <input type="range" id="sl-corr" min="0.2" max="3" step="0.1" value="0.8"
-               oninput="updateSlider('sl-corr','lbl-corr',v=>v+'s'); sendCfg('correction_duration',+this.value)">
-        <span class="val-lbl" id="lbl-corr">0.8s</span>
+        <label>Backup clearance</label>
+        <input type="range" id="sl-backup-clear" min="15" max="50" value="25"
+               oninput="updateSlider('sl-backup-clear','lbl-backup-clear',v=>v+'cm'); sendCfg('backup_clearance',+this.value)">
+        <span class="val-lbl" id="lbl-backup-clear">25cm</span>
       </div>
       <div class="slider-row">
-        <label>Steer dead-zone (px)</label>
-        <input type="range" id="sl-stth" min="5" max="100" step="5" value="30"
-               oninput="updateSlider('sl-stth','lbl-stth',v=>v+'px'); sendCfg('steer_threshold',+this.value)">
-        <span class="val-lbl" id="lbl-stth">30px</span>
+        <label>Back safety distance</label>
+        <input type="range" id="sl-back-safety" min="5" max="20" value="10"
+               oninput="updateSlider('sl-back-safety','lbl-back-safety',v=>v+'cm'); sendCfg('back_safety_distance',+this.value)">
+        <span class="val-lbl" id="lbl-back-safety">10cm</span>
       </div>
     </div>
 
     <!-- Safety thresholds -->
     <div class="card">
-      <h3>Safety Thresholds</h3>
+      <h3>Decision Thresholds (cm)</h3>
       <div class="slider-row">
-        <label>Emergency stop (cm)</label>
-        <input type="range" id="sl-stop" min="5" max="50" value="15"
-               oninput="updateSlider('sl-stop','lbl-stop',v=>v+'cm'); sendCfg('stop_distance',+this.value)">
-        <span class="val-lbl" id="lbl-stop">15cm</span>
+        <label>Front stop distance</label>
+        <input type="range" id="sl-front-stop" min="10" max="50" value="20"
+               oninput="updateSlider('sl-front-stop','lbl-front-stop',v=>v+'cm'); sendCfg('front_stop_distance',+this.value)">
+        <span class="val-lbl" id="lbl-front-stop">20cm</span>
       </div>
       <div class="slider-row">
-        <label>Slow zone (cm)</label>
-        <input type="range" id="sl-slow" min="10" max="100" value="30"
-               oninput="updateSlider('sl-slow','lbl-slow',v=>v+'cm'); sendCfg('slow_distance',+this.value)">
-        <span class="val-lbl" id="lbl-slow">30cm</span>
-      </div>
-      <div class="slider-row">
-        <label>Side avoid (cm)</label>
-        <input type="range" id="sl-side" min="5" max="40" value="12"
-               oninput="updateSlider('sl-side','lbl-side',v=>v+'cm'); sendCfg('side_distance',+this.value)">
-        <span class="val-lbl" id="lbl-side">12cm</span>
+        <label>Side avoid distance</label>
+        <input type="range" id="sl-side-avoid" min="5" max="40" value="20"
+               oninput="updateSlider('sl-side-avoid','lbl-side-avoid',v=>v+'cm'); sendCfg('side_avoid_distance',+this.value)">
+        <span class="val-lbl" id="lbl-side-avoid">20cm</span>
       </div>
     </div>
 
     <!-- Speed -->
     <div class="card">
-      <h3>Speed (0–255)</h3>
+      <h3>Motor Speeds (0–255)</h3>
       <div class="slider-row">
-        <label>Base speed</label>
-        <input type="range" id="sl-base" min="50" max="255" value="200"
-               oninput="updateSlider('sl-base','lbl-base',v=>v); sendCfg('base_speed',+this.value)">
-        <span class="val-lbl" id="lbl-base">200</span>
+        <label>Normal forward</label>
+        <input type="range" id="sl-motor-normal" min="50" max="255" value="200"
+               oninput="updateSlider('sl-motor-normal','lbl-motor-normal',v=>v); sendCfg('motor_speed_normal',+this.value)">
+        <span class="val-lbl" id="lbl-motor-normal">200</span>
       </div>
       <div class="slider-row">
-        <label>Slow speed</label>
-        <input type="range" id="sl-slsp" min="30" max="200" value="130"
-               oninput="updateSlider('sl-slsp','lbl-slsp',v=>v); sendCfg('slow_speed',+this.value)">
-        <span class="val-lbl" id="lbl-slsp">130</span>
+        <label>Hard turn</label>
+        <input type="range" id="sl-motor-hard" min="50" max="255" value="220"
+               oninput="updateSlider('sl-motor-hard','lbl-motor-hard',v=>v); sendCfg('motor_speed_hard',+this.value)">
+        <span class="val-lbl" id="lbl-motor-hard">220</span>
       </div>
       <div class="slider-row">
-        <label>Turn speed</label>
-        <input type="range" id="sl-turn" min="30" max="255" value="160"
-               oninput="updateSlider('sl-turn','lbl-turn',v=>v); sendCfg('turn_speed',+this.value)">
-        <span class="val-lbl" id="lbl-turn">160</span>
+        <label>Backup speed</label>
+        <input type="range" id="sl-motor-backup" min="50" max="255" value="160"
+               oninput="updateSlider('sl-motor-backup','lbl-motor-backup',v=>v); sendCfg('motor_speed_backup',+this.value)">
+        <span class="val-lbl" id="lbl-motor-backup">160</span>
       </div>
     </div>
 
@@ -1003,18 +976,14 @@ DASHBOARD = r"""
 <script>
   let carRunning    = false;
   let runDuration   = 0;
-  let steerTimeout  = 2.0;
   let prevCmd       = "";
-  let prevCorr      = false;
   const log         = document.getElementById('log');
 
-  // ── Slider helper ──
   function updateSlider(sliderId, lblId, fmt) {
     const v = document.getElementById(sliderId).value;
     document.getElementById(lblId).textContent = fmt(v);
   }
 
-  // ── Send config key/value to server ──
   async function sendCfg(key, value) {
     await fetch('/config', {
       method: 'POST',
@@ -1023,7 +992,6 @@ DASHBOARD = r"""
     });
   }
 
-  // ── Start / Stop ──
   async function toggleCar() {
     carRunning = !carRunning;
     await fetch('/config', {
@@ -1046,12 +1014,10 @@ DASHBOARD = r"""
     }
   }
 
-  // ── Sensor colour ──
   function sensorClass(v) {
     return v > 30 ? 'sv ok' : v > 15 ? 'sv warn' : 'sv crit';
   }
 
-  // ── Event log ──
   function addLog(msg, cls='entry') {
     const el = document.createElement('div');
     el.className = 'entry ' + cls;
@@ -1061,12 +1027,10 @@ DASHBOARD = r"""
     if (log.children.length > 40) log.lastChild.remove();
   }
 
-  // ── Poll /status every 150ms ──
   async function poll() {
     try {
       const d = await (await fetch('/status')).json();
 
-      // Car running state (may have been auto-stopped by timer)
       if (d.car_running !== carRunning) {
         carRunning = d.car_running;
         updateStartBtn();
@@ -1075,7 +1039,12 @@ DASHBOARD = r"""
 
       // Badge
       const badge = document.getElementById('status-badge');
-      if (d.correcting) {
+      const carState = d.car_state || 'NORMAL';
+      
+      if (carState === 'BACKING_UP') {
+        badge.textContent = 'BACKING UP';
+        badge.className   = 'badge backing';
+      } else if (d.correcting) {
         badge.textContent = 'CORRECTING';
         badge.className   = 'badge correct';
       } else if (carRunning) {
@@ -1096,12 +1065,14 @@ DASHBOARD = r"""
       const cmdEl = document.getElementById('cmd-display');
       cmdEl.style.color = cmd.startsWith('S') ? 'var(--danger)'
                         : cmd.startsWith('F') ? 'var(--green)'
-                        : cmd.startsWith('B') ? '#88aaff'
+                        : cmd.startsWith('B') ? '#b488ff'
                         : 'var(--warn)';
 
       // Log new commands
       if (cmd !== prevCmd) {
-        addLog(cmd + '  ' + (d.reason||''), d.correcting ? 'corr' : 'entry');
+        const logClass = carState === 'BACKING_UP' ? 'backup' : 
+                        d.correcting ? 'corr' : 'entry';
+        addLog(cmd + '  ' + (d.reason||''), logClass);
         prevCmd = cmd;
       }
 
@@ -1114,7 +1085,7 @@ DASHBOARD = r"""
         el.className   = sensorClass(s[k] ?? 999);
       });
 
-      // Vision Obstacle Detection Display
+      // Vision
       const visionObs = d.vision_obstacle || false;
       const visionPos = d.vision_position || 'none';
       const visionStatusEl = document.getElementById('vision-status');
@@ -1132,39 +1103,7 @@ DASHBOARD = r"""
         visionPosEl.style.color = 'var(--muted)';
       }
 
-      // Steer tracker
-      const steerDir  = d.steer_direction;
-      const steerSince = d.steer_since;
-      const stto       = d.steer_timeout || 2;
-      steerTimeout     = stto;
-
-      const dirEl  = document.getElementById('steer-dir-lbl');
-      const barEl  = document.getElementById('steer-bar');
-      const timeEl = document.getElementById('steer-time-lbl');
-      const corrEl = document.getElementById('corr-lbl');
-
-      if (d.correcting) {
-        dirEl.textContent  = '↺';
-        barEl.style.width  = '100%';
-        barEl.style.background = 'var(--purple)';
-        corrEl.textContent = 'CORRECTING';
-      } else if (steerDir && steerSince) {
-        const elapsed = Math.min(Date.now()/1000 - steerSince, stto);
-        const pct     = Math.round((elapsed / stto) * 100);
-        dirEl.textContent  = steerDir;
-        barEl.style.width  = pct + '%';
-        barEl.style.background = pct > 75 ? 'var(--danger)' : 'var(--warn)';
-        timeEl.textContent = elapsed.toFixed(1) + 's';
-        corrEl.textContent = '';
-      } else {
-        dirEl.textContent  = '—';
-        barEl.style.width  = '0%';
-        timeEl.textContent = '0.0s';
-        corrEl.textContent = '';
-        barEl.style.background = 'var(--warn)';
-      }
-
-      // Run timer bar
+      // Timer bar
       const timerEl  = document.getElementById('timer-overlay');
       const timerBar = document.getElementById('timer-bar');
       const rd = d.run_duration || 0;
@@ -1201,8 +1140,8 @@ SOURCE = "upload"   # "upload" for test_client | "esp32" for real hardware
 
 if __name__ == "__main__":
     if SOURCE == "esp32":
-        threading.Thread(target=esp32_stream_loop, daemon=True).start()
-        log.info("Mode: ESP32-CAM stream")
+        # ESP32-CAM stream mode (not implemented in this version)
+        log.info("Mode: ESP32-CAM stream (not implemented)")
     else:
         log.info("Mode: waiting for frame uploads (test_client.py)")
 
