@@ -9,6 +9,19 @@ ESP32 Dev Board that:
   - Controls motors via L298N driver
 
 Camera streaming handled separately by phone IP camera app
+
+⚠️ IMPORTANT: CAR IS PHYSICALLY REVERSED
+- Camera is at the BACK of the car (which is now the logical FRONT)
+- Physical front sensor → Logical back
+- Physical back sensor → Logical front  
+- Physical left sensor → Logical right
+- Physical right sensor → Logical left
+- Forward command → Moves backward physically
+- Backward command → Moves forward physically
+- Left command → Turns right physically
+- Right command → Turns left physically
+
+This code handles the reversal automatically.
 ============================================================
 */
 
@@ -58,9 +71,9 @@ String SENSOR_URL = String("http://") + SERVER_IP + ":" + SERVER_PORT + "/sensor
 // ============================================================
 // MOTOR SPEED SETTINGS
 // ============================================================
-#define MOTOR_SPEED_NORMAL  200   // Normal forward speed (0-255)
-#define MOTOR_SPEED_TURN    180   // Speed during turns (0-255)
-#define MOTOR_SPEED_HARD    220   // Speed during hard turns (0-255)
+#define MOTOR_SPEED_NORMAL  150   // Normal forward speed (0-255)
+#define MOTOR_SPEED_TURN    130   // Speed during turns (0-255)
+#define MOTOR_SPEED_HARD    170   // Speed during hard turns (0-255)
 
 // PWM Settings
 #define PWM_FREQ      5000   // PWM frequency
@@ -73,6 +86,13 @@ String SENSOR_URL = String("http://") + SERVER_IP + ":" + SERVER_PORT + "/sensor
 // ============================================================
 #define SENSOR_INTERVAL   100    // Read sensors every 100ms
 #define WS_RECONNECT_DELAY 2000  // WebSocket reconnect delay
+
+// ============================================================
+// LOCAL AVOIDANCE CONFIG
+// ============================================================
+#define FRONT_THRESHOLD   20    // cm — trigger avoidance when front blocked
+#define BACKUP_DURATION   600   // ms — how long to back up
+#define TURN_DURATION     700   // ms — how long to hold the turn
 
 // ============================================================
 // GLOBAL VARIABLES
@@ -104,34 +124,46 @@ float readDistance(int trig, int echo) {
   long duration = pulseIn(echo, HIGH, 30000);  // 30ms timeout
   
   if (duration == 0) {
-    return 999.0;  // No echo received
+    return -1;  // No echo received (noise)
   }
   
   float distance = duration * 0.034 / 2.0;
   
-  // Clamp to reasonable range
-  if (distance < 2.0) distance = 2.0;
-  if (distance > 400.0) distance = 999.0;
+  // Filter noise: > 500cm is invalid
+  if (distance > 500.0) {
+    return -1;  // Invalid reading (noise)
+  }
   
   return distance;
 }
 
 void readAllSensors() {
-  float f = readDistance(TRIG_F, ECHO_F);
-  float l = readDistance(TRIG_L, ECHO_L);
-  float r = readDistance(TRIG_R, ECHO_R);
-  // float b = readDistance(TRIG_B, ECHO_B);  // Temporarily disabled
+  // REVERSED: Physical sensors are reversed
+  // What was "front" sensor is now "back" (camera side is now front)
+  // What was "back" sensor is now "front"
+  // What was "left" is now "right"
+  // What was "right" is now "left"
   
-  // Update only valid readings (>2 cm)
-  if (f > 2) frontDist = f;
-  if (l > 2) leftDist  = l;
-  if (r > 2) rightDist = r;
-  // if (b > 2) backDist  = b;
+  float physical_f = readDistance(TRIG_F, ECHO_F);
+  float physical_l = readDistance(TRIG_L, ECHO_L);
+  float physical_r = readDistance(TRIG_R, ECHO_R);
+  float physical_b = readDistance(TRIG_B, ECHO_B);
   
-  // Keep back sensor at safe distance (no obstacle)
-  backDist = 100.0;
+  // SWAP: Physical front → Logical back, Physical back → Logical front
+  // SWAP: Physical left → Logical right, Physical right → Logical left
+  float logical_front = physical_b;  // Back sensor is now front
+  float logical_back = physical_f;   // Front sensor is now back
+  float logical_left = physical_r;   // Right sensor is now left
+  float logical_right = physical_l;  // Left sensor is now right
   
-  // Debug output
+  // Update only VALID readings (> 0 means valid, -1 means noise/invalid)
+  // Keep last recorded distance if reading is invalid
+  if (logical_front > 0) frontDist = logical_front;
+  if (logical_back > 0) backDist = logical_back;
+  if (logical_left > 0) leftDist = logical_left;
+  if (logical_right > 0) rightDist = logical_right;
+  
+  // Debug output (shows logical directions with last valid values)
   Serial.print("F: "); Serial.print(frontDist);
   Serial.print(" B: "); Serial.print(backDist);
   Serial.print(" L: "); Serial.print(leftDist);
@@ -163,41 +195,43 @@ void stopMotors() {
 }
 
 void moveForward(int speed) {
+  // REVERSED: Forward is now backward (camera at back)
   digitalWrite(ENA, HIGH);
   digitalWrite(ENB, HIGH);
-  digitalWrite(IN1, HIGH);
-  digitalWrite(IN2, LOW);
-  digitalWrite(IN3, HIGH);
-  digitalWrite(IN4, LOW);
+  digitalWrite(IN1, LOW);
+  digitalWrite(IN2, HIGH);
+  digitalWrite(IN3, LOW);
+  digitalWrite(IN4, HIGH);
 }
 
 void moveBackward(int speed) {
+  // REVERSED: Backward is now forward (camera at back)
   digitalWrite(ENA, HIGH);
   digitalWrite(ENB, HIGH);
-  digitalWrite(IN1, LOW);
-  digitalWrite(IN2, HIGH);
-  digitalWrite(IN3, LOW);
-  digitalWrite(IN4, HIGH);
+  digitalWrite(IN1, HIGH);
+  digitalWrite(IN2, LOW);
+  digitalWrite(IN3, HIGH);
+  digitalWrite(IN4, LOW);
 }
 
 void turnLeft(int speed) {
+  // Left: left motor backward, right motor forward
   digitalWrite(ENA, HIGH);
   digitalWrite(ENB, HIGH);
-  // Left motor forward, right motor backward
   digitalWrite(IN1, HIGH);
-  digitalWrite(IN2, LOW);
+  digitalWrite(IN2, LOW);   // Left motor BACKWARD
   digitalWrite(IN3, LOW);
-  digitalWrite(IN4, HIGH);
+  digitalWrite(IN4, HIGH);  // Right motor FORWARD
 }
 
 void turnRight(int speed) {
+  // Right: left motor forward, right motor backward
   digitalWrite(ENA, HIGH);
   digitalWrite(ENB, HIGH);
-  // Left motor backward, right motor forward
   digitalWrite(IN1, LOW);
-  digitalWrite(IN2, HIGH);
+  digitalWrite(IN2, HIGH);  // Left motor FORWARD
   digitalWrite(IN3, HIGH);
-  digitalWrite(IN4, LOW);
+  digitalWrite(IN4, LOW);   // Right motor BACKWARD
 }
 
 void hardLeft(int speed) {
@@ -206,6 +240,33 @@ void hardLeft(int speed) {
 
 void hardRight(int speed) {
   turnRight(speed);
+}
+
+// ============================================================
+// LOCAL AVOIDANCE (backup + turn toward more space)
+// ============================================================
+void localAvoidance() {
+  Serial.printf("[AVOID] Front blocked (%.1fcm) — backing up\n", frontDist);
+
+  // 1. Back up
+  moveBackward(MOTOR_SPEED_HARD);
+  delay(BACKUP_DURATION);
+  stopMotors();
+  delay(100);
+
+  // Re-read sensors after backing up
+  readAllSensors();
+
+  // 2. Turn toward the side with more space
+  if (leftDist >= rightDist) {
+    Serial.printf("[AVOID] Turning LEFT (L=%.1f R=%.1f)\n", leftDist, rightDist);
+    hardLeft(MOTOR_SPEED_HARD);
+  } else {
+    Serial.printf("[AVOID] Turning RIGHT (L=%.1f R=%.1f)\n", leftDist, rightDist);
+    hardRight(MOTOR_SPEED_HARD);
+  }
+  delay(TURN_DURATION);
+  stopMotors();
 }
 
 // ============================================================
@@ -375,10 +436,10 @@ void setup() {
   pinMode(ECHO_L, INPUT);
   pinMode(TRIG_R, OUTPUT);
   pinMode(ECHO_R, INPUT);
-  // pinMode(TRIG_B, OUTPUT);  // Disabled - uncomment when back sensor connected
-  // pinMode(ECHO_B, INPUT);
+  pinMode(TRIG_B, OUTPUT);
+  pinMode(ECHO_B, INPUT);
   
-  Serial.println("[SENSOR] Ultrasonic sensors initialized (F/L/R only)");
+  Serial.println("[SENSOR] Ultrasonic sensors initialized (F/B/L/R - REVERSED)");
   
   // Setup motors
   setupMotors();
@@ -428,6 +489,11 @@ void loop() {
     
     readAllSensors();
     sendSensorData();
+
+    // Local avoidance — override server if front is blocked
+    if (carRunning && frontDist < FRONT_THRESHOLD) {
+      localAvoidance();
+    }
   }
   
   // Small delay to prevent watchdog issues
