@@ -104,6 +104,7 @@ unsigned long lastSensorRead = 0;
 
 String currentCommand = "S:0";
 bool carRunning = false;
+bool stopRequested = false;  // Set by WebSocket, checked during avoidance
 
 // Last valid sensor readings
 float frontDist = 100.0;
@@ -195,7 +196,6 @@ void stopMotors() {
 }
 
 void moveForward(int speed) {
-  // REVERSED: Forward is now backward (camera at back)
   digitalWrite(ENA, HIGH);
   digitalWrite(ENB, HIGH);
   digitalWrite(IN1, LOW);
@@ -205,7 +205,6 @@ void moveForward(int speed) {
 }
 
 void moveBackward(int speed) {
-  // REVERSED: Backward is now forward (camera at back)
   digitalWrite(ENA, HIGH);
   digitalWrite(ENB, HIGH);
   digitalWrite(IN1, HIGH);
@@ -215,7 +214,6 @@ void moveBackward(int speed) {
 }
 
 void turnLeft(int speed) {
-  // Left: left motor backward, right motor forward
   digitalWrite(ENA, HIGH);
   digitalWrite(ENB, HIGH);
   digitalWrite(IN1, HIGH);
@@ -225,7 +223,6 @@ void turnLeft(int speed) {
 }
 
 void turnRight(int speed) {
-  // Right: left motor forward, right motor backward
   digitalWrite(ENA, HIGH);
   digitalWrite(ENB, HIGH);
   digitalWrite(IN1, LOW);
@@ -245,14 +242,27 @@ void hardRight(int speed) {
 // ============================================================
 // LOCAL AVOIDANCE (backup + turn toward more space)
 // ============================================================
+
+// Interruptible delay — keeps WebSocket alive and checks for stop
+void avoidDelay(int ms) {
+  unsigned long start = millis();
+  while (millis() - start < ms) {
+    webSocket.loop();
+    if (stopRequested) return;
+    delay(5);
+  }
+}
+
 void localAvoidance() {
+  stopRequested = false;
   Serial.printf("[AVOID] Front blocked (%.1fcm) — backing up\n", frontDist);
 
   // 1. Back up
   moveBackward(MOTOR_SPEED_HARD);
-  delay(BACKUP_DURATION);
+  avoidDelay(BACKUP_DURATION);
   stopMotors();
-  delay(100);
+  if (stopRequested) { Serial.println("[AVOID] Interrupted by stop"); return; }
+  avoidDelay(100);
 
   // Re-read sensors after backing up
   readAllSensors();
@@ -265,8 +275,13 @@ void localAvoidance() {
     Serial.printf("[AVOID] Turning RIGHT (L=%.1f R=%.1f)\n", leftDist, rightDist);
     hardRight(MOTOR_SPEED_HARD);
   }
-  delay(TURN_DURATION);
+  avoidDelay(TURN_DURATION);
   stopMotors();
+  if (stopRequested) { Serial.println("[AVOID] Interrupted by stop"); return; }
+
+  // Resume forward
+  moveForward(MOTOR_SPEED_NORMAL);
+  Serial.println("[AVOID] Done — resuming forward");
 }
 
 // ============================================================
@@ -348,13 +363,14 @@ void webSocketEvent(WStype_t type, uint8_t * payload, size_t length) {
         Serial.printf("[WS ← SERVER] %s\n", message.c_str());
         
         // Execute command if car is running
-        if (carRunning) {
-          executeCommand(message);
+        if (message.startsWith("S:")) {
+          stopRequested = true;
+          carRunning = false;
+          stopMotors();
         } else {
-          // If stopped, only accept stop command
-          if (message.startsWith("S:")) {
-            stopMotors();
-          }
+          stopRequested = false;
+          carRunning = true;
+          executeCommand(message);
         }
       }
       break;
