@@ -23,13 +23,13 @@ Hardware Requirements:
 // ============================================================
 // WIFI CONFIGURATION - CHANGE THESE!
 // ============================================================
-const char* WIFI_SSID = "Airtel_anki_5050";
-const char* WIFI_PASSWORD = "Air@32689";
+const char* WIFI_SSID = "Satyam";
+const char* WIFI_PASSWORD = "lelobhai";
 
 // ============================================================
 // SERVER CONFIGURATION - CHANGE THESE!
 // ============================================================
-const char* SERVER_IP = "192.168.1.4";
+const char* SERVER_IP = "10.125.85.154";
 const int SERVER_PORT = 5000;
 
 String STREAM_URL = String("http://") + SERVER_IP + ":" + SERVER_PORT + "/upload_frame";

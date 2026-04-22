@@ -33,13 +33,13 @@ This code handles the reversal automatically.
 // ============================================================
 // WIFI CONFIGURATION - CHANGE THESE!
 // ============================================================
-const char* WIFI_SSID = "Airtel_anki_5050";        // Change to your WiFi name
-const char* WIFI_PASSWORD = "Air@32689"; // Change to your WiFi password
+const char* WIFI_SSID = "Satyam";        // Change to your WiFi name
+const char* WIFI_PASSWORD = "lelobhai"; // Change to your WiFi password
 
 // ============================================================
 // SERVER CONFIGURATION - CHANGE THESE!
 // ============================================================
-const char* SERVER_IP = "192.168.1.4";  // Change to your server IP
+const char* SERVER_IP = "10.125.85.154";  // Change to your server IP
 const int SERVER_PORT = 5000;
 
 String SENSOR_URL = String("http://") + SERVER_IP + ":" + SERVER_PORT + "/sensors";
@@ -84,15 +84,15 @@ String SENSOR_URL = String("http://") + SERVER_IP + ":" + SERVER_PORT + "/sensor
 // ============================================================
 // TIMING CONFIGURATION
 // ============================================================
-#define SENSOR_INTERVAL   100    // Read sensors every 100ms
+#define SENSOR_INTERVAL   50     // ms — faster local checks on slow network
 #define WS_RECONNECT_DELAY 2000  // WebSocket reconnect delay
 
 // ============================================================
 // LOCAL AVOIDANCE CONFIG
 // ============================================================
-#define FRONT_THRESHOLD   20    // cm — trigger avoidance when front blocked
-#define BACKUP_DURATION   600   // ms — how long to back up
-#define TURN_DURATION     700   // ms — how long to hold the turn
+#define FRONT_THRESHOLD   25   // cm — higher = more reaction time on slow network
+#define BACKUP_DURATION   1100  // ms — how long to back up
+#define TURN_DURATION     1100  // ms — how long to hold the turn
 
 // ============================================================
 // GLOBAL VARIABLES
@@ -257,12 +257,22 @@ void localAvoidance() {
   stopRequested = false;
   Serial.printf("[AVOID] Front blocked (%.1fcm) — backing up\n", frontDist);
 
-  // 1. Back up
+  // 1. Back up — stop early if back sensor hits something
   moveBackward(MOTOR_SPEED_HARD);
-  avoidDelay(BACKUP_DURATION);
+  unsigned long backStart = millis();
+  while (millis() - backStart < BACKUP_DURATION) {
+    webSocket.loop();
+    if (stopRequested) { stopMotors(); Serial.println("[AVOID] Interrupted"); return; }
+    readAllSensors();
+    if (backDist < 15) {
+      Serial.printf("[AVOID] Back blocked at %.1fcm — stopping backup early\n", backDist);
+      break;
+    }
+    delay(5);
+  }
   stopMotors();
-  if (stopRequested) { Serial.println("[AVOID] Interrupted by stop"); return; }
   avoidDelay(100);
+  if (stopRequested) return;
 
   // Re-read sensors after backing up
   readAllSensors();
@@ -277,7 +287,23 @@ void localAvoidance() {
   }
   avoidDelay(TURN_DURATION);
   stopMotors();
-  if (stopRequested) { Serial.println("[AVOID] Interrupted by stop"); return; }
+  if (stopRequested) return;
+  avoidDelay(100);
+
+  // 3. Re-check front after turning — if still blocked, try opposite turn
+  readAllSensors();
+  if (frontDist < FRONT_THRESHOLD) {
+    Serial.printf("[AVOID] Still blocked after turn (F=%.1fcm) — trying opposite\n", frontDist);
+    if (leftDist >= rightDist) {
+      hardLeft(MOTOR_SPEED_HARD);
+    } else {
+      hardRight(MOTOR_SPEED_HARD);
+    }
+    avoidDelay(TURN_DURATION);
+    stopMotors();
+    if (stopRequested) return;
+    avoidDelay(100);
+  }
 
   // Resume forward
   moveForward(MOTOR_SPEED_NORMAL);

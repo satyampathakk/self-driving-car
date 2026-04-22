@@ -37,11 +37,11 @@ log.info("Vision obstacle detector initialized (MINIMAL mode)")
 cfg_lock = threading.Lock()
 cfg = {
     # Sensor decision thresholds (cm)
-    "front_stop_distance": 25,   # Front < 25cm triggers decision
+    "front_stop_distance": 25,   # Front < 35cm triggers decision (higher for network lag)
     "side_avoid_distance": 25,   # Side < 25cm used when front blocked
     "backup_threshold":    25,   # Both sides < 25cm → backup
     "backup_clearance":    25,   # Need 25cm clearance to stop backing up
-    "back_safety_distance": 10,  # Don't backup if back < 10cm
+    "back_safety_distance": 15,  # Don't backup if back < 15cm
     
     # Backup behavior
     "backup_before_turn": True,   # True = backup first, then turn; False = turn directly
@@ -96,11 +96,13 @@ state = {
     "vision_position":  "none",
     
     # Backup state machine
-    "car_state":        "NORMAL",     # NORMAL, BACKING_UP, BACKING_BEFORE_TURN, STOPPED
+    "car_state":        "NORMAL",     # NORMAL, BACKING_UP, BACKING_BEFORE_TURN, TURNING, STOPPED
     "backup_started_at": None,
-    "backup_initial_distance": None,  # Track how far we've backed up
+    "backup_initial_distance": None,
     "preferred_turn_direction": 0,    # 1 = left, -1 = right, 0 = not set
-    "pending_turn_command": None,     # Store turn command to execute after backup
+    "pending_turn_command": None,
+    "turn_started_at": None,          # When current turn began
+    "last_turn_direction": 0,         # Track last turn to try opposite if still blocked
 }
 
 ws_clients = set()
@@ -372,6 +374,8 @@ def decide(steer_offset: int, visual_obstacle: bool, vision_position: str) -> tu
         backup_initial_distance = state["backup_initial_distance"]
         preferred_turn = state["preferred_turn_direction"]
         pending_turn = state["pending_turn_command"]
+        turn_started_at = state["turn_started_at"]
+        last_turn_direction = state["last_turn_direction"]
     
     with cfg_lock:
         motor_normal = cfg["motor_speed_normal"]
@@ -423,22 +427,56 @@ def decide(steer_offset: int, visual_obstacle: bool, vision_position: str) -> tu
         if backup_initial_distance is not None:
             backed_up_distance = backup_initial_distance - back
             if backed_up_distance >= backup_distance:
-                # Done backing up - execute the pending turn
-                log.info(f"[DECISION] Backed up {backed_up_distance:.1f}cm - executing turn")
+                log.info(f"[DECISION] Backed up {backed_up_distance:.1f}cm - entering TURNING")
                 with state_lock:
-                    state["car_state"] = "NORMAL"
+                    turn_cmd = state["pending_turn_command"] or f"HL:{motor_hard}"
+                    turn_dir = state["preferred_turn_direction"] or 1
+                    state["car_state"] = "TURNING"
                     state["backup_started_at"] = None
                     state["backup_initial_distance"] = None
-                    turn_cmd = state["pending_turn_command"]
-                    state["pending_turn_command"] = None
-                
-                if turn_cmd:
-                    return turn_cmd, f"TURN after backup: {turn_cmd}"
-                else:
-                    return f"F:{motor_normal}", "FORWARD after backup"
+                    state["pending_turn_command"] = turn_cmd
+                    state["turn_started_at"] = time.time()
+                    state["last_turn_direction"] = turn_dir
+                return turn_cmd, f"TURNING after backup: {turn_cmd}"
         
         # Keep backing up
         return f"B:{motor_backup}", f"BACKING UP before turn ({elapsed:.1f}s)"
+
+    # ════════════════════════════════════════════════════════════
+    # STATE: TURNING — hold turn, then re-check front
+    # ════════════════════════════════════════════════════════════
+    if car_state == "TURNING":
+        elapsed = time.time() - (turn_started_at or time.time())
+        turn_hold = 1.1  # seconds
+
+        if elapsed < turn_hold:
+            turn_cmd = pending_turn or f"HL:{motor_hard}"
+            return turn_cmd, f"TURNING ({elapsed:.1f}s)"
+
+        # Turn complete — re-check front
+        if front < front_threshold:
+            # Still blocked — try opposite direction
+            if last_turn_direction == 1:
+                opp_cmd = f"HR:{motor_hard}"
+                opp_dir = -1
+                log.info(f"[DECISION] Still blocked after LEFT turn — trying RIGHT (F={front})")
+            else:
+                opp_cmd = f"HL:{motor_hard}"
+                opp_dir = 1
+                log.info(f"[DECISION] Still blocked after RIGHT turn — trying LEFT (F={front})")
+            with state_lock:
+                state["pending_turn_command"] = opp_cmd
+                state["turn_started_at"] = time.time()
+                state["last_turn_direction"] = opp_dir
+            return opp_cmd, f"RETRY TURN opposite: still blocked F={front}"
+
+        # Front clear — resume forward
+        log.info(f"[DECISION] Turn complete, front clear F={front} — resuming")
+        with state_lock:
+            state["car_state"] = "NORMAL"
+            state["pending_turn_command"] = None
+            state["turn_started_at"] = None
+        return f"F:{motor_normal}", f"FORWARD: Turn complete, front clear"
 
     # ════════════════════════════════════════════════════════════
     # STATE: BACKING_UP
@@ -464,41 +502,31 @@ def decide(steer_offset: int, visual_obstacle: bool, vision_position: str) -> tu
         right_clear = (right >= backup_clear)
         
         if left_clear or right_clear:
-            # We have space! Stop backing up and turn
-            log.info(f"[DECISION] Space created! L={left} R={right}")
-            
-            # Decide which way to turn
+            # We have space — transition to TURNING state
+            log.info(f"[DECISION] Space created! L={left} R={right} — entering TURNING")
+
             if right_clear and not left_clear:
-                log.info("[DECISION] Right clear - turning RIGHT")
-                with state_lock:
-                    state["car_state"] = "NORMAL"
-                    state["backup_started_at"] = None
-                    state["preferred_turn_direction"] = -1
-                return f"HR:{motor_hard}", f"RIGHT: Space created on right (R={right})"
-            
+                turn_cmd = f"HR:{motor_hard}"
+                turn_dir = -1
             elif left_clear and not right_clear:
-                log.info("[DECISION] Left clear - turning LEFT")
-                with state_lock:
-                    state["car_state"] = "NORMAL"
-                    state["backup_started_at"] = None
-                    state["preferred_turn_direction"] = 1
-                return f"HL:{motor_hard}", f"LEFT: Space created on left (L={left})"
-            
+                turn_cmd = f"HL:{motor_hard}"
+                turn_dir = 1
             else:
-                # Both clear - use preferred or default left
                 if preferred_turn == -1:
-                    log.info("[DECISION] Both clear - using preferred RIGHT")
-                    with state_lock:
-                        state["car_state"] = "NORMAL"
-                        state["backup_started_at"] = None
-                    return f"HR:{motor_hard}", f"RIGHT: Both sides clear (preferred)"
+                    turn_cmd = f"HR:{motor_hard}"
+                    turn_dir = -1
                 else:
-                    log.info("[DECISION] Both clear - using preferred LEFT")
-                    with state_lock:
-                        state["car_state"] = "NORMAL"
-                        state["backup_started_at"] = None
-                        state["preferred_turn_direction"] = 1
-                    return f"HL:{motor_hard}", f"LEFT: Both sides clear (default)"
+                    turn_cmd = f"HL:{motor_hard}"
+                    turn_dir = 1
+
+            with state_lock:
+                state["car_state"] = "TURNING"
+                state["backup_started_at"] = None
+                state["preferred_turn_direction"] = turn_dir
+                state["pending_turn_command"] = turn_cmd
+                state["turn_started_at"] = time.time()
+                state["last_turn_direction"] = turn_dir
+            return turn_cmd, f"TURNING {'LEFT' if turn_dir == 1 else 'RIGHT'}: space created L={left} R={right}"
         
         # Still boxed in - keep backing up
         return f"B:{motor_backup}", f"BACKING UP: Still boxed in L={left} R={right} ({elapsed:.1f}s)"
@@ -521,10 +549,10 @@ def decide(steer_offset: int, visual_obstacle: bool, vision_position: str) -> tu
     # ════════════════════════════════════════════════════════════
     
     # Front < 25cm → obstacle avoidance
-    if front < 25:
+    if front < front_threshold:
         
-        # ─── CASE 1: All three directions blocked (< 25cm) ───
-        if right < 25 and left < 25:
+        # ─── CASE 1: All three directions blocked ───
+        if right < front_threshold and left < front_threshold:
             # ALL BLOCKED! Need to back up first
             
             # Check if we can safely back up
@@ -555,11 +583,8 @@ def decide(steer_offset: int, visual_obstacle: bool, vision_position: str) -> tu
                 return f"B:{motor_backup}", f"BACKING UP: Boxed in F={front} L={left} R={right}"
         
         # ─── CASE 2: Front + Right blocked (< 25cm), Left clear ───
-        elif right < 25 and left >= 25:
-            # Right is blocked, left is clear → Turn LEFT
+        elif right < front_threshold and left >= front_threshold:
             turn_cmd = f"HL:{motor_hard}"
-            
-            # Check if we should backup before turning
             if backup_before_turn and back >= back_safety + backup_distance:
                 log.info(f"[DECISION] Front+Right blocked - backing up before LEFT turn")
                 with state_lock:
@@ -571,15 +596,16 @@ def decide(steer_offset: int, visual_obstacle: bool, vision_position: str) -> tu
                 return f"B:{motor_backup}", f"BACKING UP before LEFT turn (F={front} R={right})"
             else:
                 with state_lock:
+                    state["car_state"] = "TURNING"
                     state["preferred_turn_direction"] = 1
-                return turn_cmd, f"LEFT: Front + right blocked (F={front} R={right})"
-        
+                    state["pending_turn_command"] = turn_cmd
+                    state["turn_started_at"] = time.time()
+                    state["last_turn_direction"] = 1
+                return turn_cmd, f"TURNING LEFT: Front+right blocked (F={front} R={right})"
+
         # ─── CASE 3: Front + Left blocked (< 25cm), Right clear ───
-        elif left < 25 and right >= 25:
-            # Left is blocked, right is clear → Turn RIGHT
+        elif left < front_threshold and right >= front_threshold:
             turn_cmd = f"HR:{motor_hard}"
-            
-            # Check if we should backup before turning
             if backup_before_turn and back >= back_safety + backup_distance:
                 log.info(f"[DECISION] Front+Left blocked - backing up before RIGHT turn")
                 with state_lock:
@@ -591,15 +617,28 @@ def decide(steer_offset: int, visual_obstacle: bool, vision_position: str) -> tu
                 return f"B:{motor_backup}", f"BACKING UP before RIGHT turn (F={front} L={left})"
             else:
                 with state_lock:
+                    state["car_state"] = "TURNING"
                     state["preferred_turn_direction"] = -1
-                return turn_cmd, f"RIGHT: Front + left blocked (F={front} L={left})"
-        
-        # ─── CASE 4: Only front blocked (< 25cm), both sides clear ───
+                    state["pending_turn_command"] = turn_cmd
+                    state["turn_started_at"] = time.time()
+                    state["last_turn_direction"] = -1
+                return turn_cmd, f"TURNING RIGHT: Front+left blocked (F={front} L={left})"
+
+        # ─── CASE 4: Only front blocked, both sides clear — turn toward more space ───
         else:
-            # Both sides clear - just turn, no need to backup (default left)
+            if left >= right:
+                turn_cmd = f"HL:{motor_hard}"
+                turn_dir = 1
+            else:
+                turn_cmd = f"HR:{motor_hard}"
+                turn_dir = -1
             with state_lock:
-                state["preferred_turn_direction"] = 1
-            return f"HL:{motor_hard}", f"LEFT: Only front blocked (F={front})"
+                state["car_state"] = "TURNING"
+                state["preferred_turn_direction"] = turn_dir
+                state["pending_turn_command"] = turn_cmd
+                state["turn_started_at"] = time.time()
+                state["last_turn_direction"] = turn_dir
+            return turn_cmd, f"TURNING {'LEFT' if turn_dir==1 else 'RIGHT'}: Only front blocked (F={front} L={left} R={right})"
     
     # ─── CASE 5: Front clear (>= 25cm) - FORWARD ───
     else:
